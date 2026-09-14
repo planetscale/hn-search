@@ -1,0 +1,21 @@
+/* Hacker News palette and type. Mirrors news.ycombinator.com so the search
+ * feels like a native part of the site rather than a separate product. */
+:root {
+  --hn-orange: #ff6600;
+  --hn-beige: #f6f6ef;
+  --hn-gray: #828282;
+  --hn-gray-line: #e2e2da;
+  --hn-ink: #000000;
+  --hn-on-orange: #000000;
+  --hn-link: #000000;
+  --hn-visited: #828282;
+
+  /* Verdana is HN's face. The rest are graceful fallbacks. */
+  --font-hn: Verdana, Geneva, 'DejaVu Sans', sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  --text-xs: 7.5pt;
+  --text-sm: 8pt;
+  --text-base: 10pt;
+  --text-lg: 12pt;
+}
