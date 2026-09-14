@@ -73,16 +73,28 @@ type HnItem = {
   descendants?: number
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Fetch JSON with backoff. HN is served through Firebase, which rate-limits
+ * bursts from datacenter IPs by returning 429 (and occasional 5xx). Those are
+ * retryable, so we back off and try again rather than dropping the item; a
+ * genuine 4xx (a missing item) is treated as absent. Without this, a throttled
+ * run silently loses almost every id in its window.
+ */
 async function fetchJson<T>(url: string, timeoutMs = 8000): Promise<T | null> {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const MAX_ATTEMPTS = 5
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const res = await fetch(url, { signal: controller.signal, cache: 'no-store' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) return null
       return (await res.json()) as T
     } catch {
-      if (attempt === 1) return null
+      if (attempt === MAX_ATTEMPTS - 1) return null
+      await sleep(250 * 2 ** attempt + Math.random() * 150)
     } finally {
       clearTimeout(timer)
     }
@@ -97,6 +109,21 @@ async function hnMaxItem(): Promise<number> {
 }
 
 const hnItem = (id: number) => fetchJson<HnItem>(`${HN_API}/item/${id}.json`)
+
+/** HN's live story rankings, each a plain array of ids. */
+const STORY_LISTS = ['newstories', 'topstories', 'beststories', 'askstories', 'showstories', 'jobstories']
+
+/** Union of the ids currently on HN's story lists, so `latest` runs can refresh
+ *  stories directly instead of hoping to catch them in the comment-heavy id
+ *  window. A few cheap array calls covering at most a few hundred unique ids. */
+async function storyListIds(): Promise<number[]> {
+  const lists = await Promise.all(STORY_LISTS.map((list) => fetchJson<number[]>(`${HN_API}/${list}.json`)))
+  const set = new Set<number>()
+  for (const list of lists) {
+    if (Array.isArray(list)) for (const id of list) if (Number.isFinite(id)) set.add(id)
+  }
+  return [...set]
+}
 
 function pgArray(values: number[] | undefined): string {
   if (!values?.length) return '{}'
@@ -212,7 +239,19 @@ export async function syncHn(opts: SyncOptions = {}): Promise<SyncResult> {
   // over a contiguous, gap-free range).
   const ids: number[] = []
   for (let id = start; id <= end; id++) ids.push(id)
-  if (mode === 'latest') ids.reverse()
+  if (mode === 'latest') {
+    ids.reverse()
+    // The id window is comment-dominated, so stories fall out of it first. Fetch
+    // HN's current story lists FIRST, then the comment-heavy window: a run that
+    // runs out of budget (or is cut short by the platform's duration cap) has
+    // still refreshed the stories the homepage ranks before spending time on the
+    // tail.
+    const storyIds = (await storyListIds()).filter((id) => id <= maxItem)
+    const seen = new Set(storyIds)
+    const rest = ids.filter((id) => !seen.has(id))
+    ids.length = 0
+    ids.push(...storyIds, ...rest)
+  }
 
   const limit = pLimit(concurrency)
   let fetched = 0

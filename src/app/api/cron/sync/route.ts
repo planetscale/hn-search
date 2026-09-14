@@ -29,7 +29,9 @@ export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams
   const mode: SyncMode = params.get('mode') === 'backfill' ? 'backfill' : 'latest'
   const batch = intParam(params.get('batch'), 10000, 1, 20000)
-  const concurrency = intParam(params.get('concurrency'), 64, 1, 128)
+  // Gentle default: Firebase throttles high-concurrency bursts from Vercel's
+  // egress IP, and a throttled run persists almost nothing.
+  const concurrency = intParam(params.get('concurrency'), 12, 1, 128)
   const fromRaw = params.get('from')
   const from = fromRaw ? intParam(fromRaw, 0, 1, Number.MAX_SAFE_INTEGER) : undefined
 
