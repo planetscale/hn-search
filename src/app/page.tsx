@@ -1,3 +1,4 @@
+import { CommunityNote } from '@/components/community-note'
 import { ItemRow } from '@/components/item-row'
 import { ResultsLoading } from '@/components/loading'
 import { QueryMeta } from '@/components/query-meta'
@@ -65,9 +66,18 @@ export default async function Page({ searchParams }: { searchParams: Promise<Rec
     <div>
       <SearchForm filters={filters} />
       <WelcomeNote />
-      <Suspense key={key} fallback={<ResultsLoading />}>
-        <Results filters={filters} page={page} />
-      </Suspense>
+      <div className="flex flex-col gap-4 sm:flex-row">
+        <div className="min-w-0 flex-1">
+          <Suspense key={key} fallback={<ResultsLoading />}>
+            <Results filters={filters} page={page} />
+          </Suspense>
+        </div>
+        {!filters.q ? (
+          <aside className="sm:w-60 sm:shrink-0">
+            <CommunityNote />
+          </aside>
+        ) : null}
+      </div>
     </div>
   )
 }
