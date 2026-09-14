@@ -67,6 +67,7 @@ const SECONDARY_INDEXES = [
   'items_by_trgm_idx',
   'items_story_new_idx',
   'items_titled_time_idx',
+  'items_search_gin',
   'items_search_bm25',
   'items_story_bm25',
   'items_comment_bm25',
@@ -83,6 +84,7 @@ CREATE INDEX IF NOT EXISTS items_story_new_idx ON items (time DESC)
   WHERE type = 'story' AND NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
 CREATE INDEX IF NOT EXISTS items_titled_time_idx ON items (time DESC)
   WHERE NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
+CREATE INDEX IF NOT EXISTS items_search_gin ON items USING gin (search_tsv);
 CREATE INDEX IF NOT EXISTS items_search_bm25 ON items USING lakebase_bm25 (search_tsv);
 CREATE INDEX IF NOT EXISTS items_story_bm25 ON items USING lakebase_bm25 (search_tsv)
   WHERE type = 'story' AND NOT deleted AND NOT dead;

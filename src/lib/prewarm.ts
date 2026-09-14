@@ -11,6 +11,7 @@ const RELATIONS = [
   'items_by_trgm_idx',
   'items_story_new_idx',
   'items_titled_time_idx',
+  'items_search_gin',
   'items_search_bm25',
   'items_story_bm25',
   'items_comment_bm25',

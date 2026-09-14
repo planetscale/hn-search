@@ -51,6 +51,7 @@ CREATE INDEX IF NOT EXISTS items_titled_time_idx ON items (time DESC)
 // BM25 indexes are opt-in (--bm25): the full corpus index plus per-type partial
 // indexes whose predicates match the app's WHERE clauses.
 const BM25_SQL = `
+CREATE INDEX IF NOT EXISTS items_search_gin ON items USING gin (search_tsv);
 CREATE INDEX IF NOT EXISTS items_search_bm25 ON items USING lakebase_bm25 (search_tsv);
 CREATE INDEX IF NOT EXISTS items_story_bm25 ON items USING lakebase_bm25 (search_tsv)
   WHERE type = 'story' AND NOT deleted AND NOT dead;

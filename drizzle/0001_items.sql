@@ -36,6 +36,9 @@ CREATE INDEX IF NOT EXISTS items_story_new_idx ON items (time DESC)
   WHERE type = 'story' AND NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
 CREATE INDEX IF NOT EXISTS items_titled_time_idx ON items (time DESC)
   WHERE NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
+-- Boolean full-text matching for exact counts: a GIN bitmap scan intersects the
+-- per-term posting lists, so multi-word (tsquery AND) counts stay exact and fast.
+CREATE INDEX IF NOT EXISTS items_search_gin ON items USING gin (search_tsv);
 CREATE INDEX IF NOT EXISTS items_search_bm25 ON items USING lakebase_bm25 (search_tsv);
 -- Per-type partial BM25 indexes. Their predicates match the app's WHERE clauses
 -- so ranking and exact counts run over one type instead of being truncated by

@@ -49,6 +49,10 @@ export const items = pgTable(
     index('items_titled_time_idx')
       .on(table.time)
       .where(sql`NOT ${table.deleted} AND NOT ${table.dead} AND ${table.title} IS NOT NULL AND ${table.title} <> ''`),
+    // Boolean full-text matching for exact match counts: a GIN bitmap scan of
+    // search_tsv intersects per-term posting lists, so multi-word (tsquery AND)
+    // counts stay exact and fast. Ranking still uses the lakebase_bm25 indexes below.
+    index('items_search_gin').using('gin', table.searchTsv),
     // Full corpus, used by the "all" tab and long-tail types (poll, pollopt).
     index('items_search_bm25').using('lakebase_bm25', table.searchTsv),
     // Per-type partial indexes: the query filters by type, so ranking and exact

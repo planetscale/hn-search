@@ -190,15 +190,19 @@ function planEstimate(rows: Row[]): number | null {
 }
 
 /**
- * Match count for the status line. A true count of full-text matches is
- * expensive and plan-fragile (for broad or multi-word terms Postgres walks the
- * whole table), so this races two things in parallel:
+ * Match count for the status line. The `items_search_gin` GIN index serves
+ * `search_tsv @@ websearch_to_tsquery(...)` through a bitmap scan, so an exact
+ * count is a plain `count(*)` over the filter — no BM25 ordering, no default_limit,
+ * and no seq scan. A multi-word query is a tsquery AND: GIN intersects the per-term
+ * posting lists, so it is the cheapest case (e.g. "openbsd chrome" ~4ms), not the
+ * pathological one it was against the BM25 ranking index. Only very common single
+ * terms approach the cap. This still races two things in parallel:
  *
- *   1. an exact count, bounded by {@link COUNT_CAP} rows and a hard
- *      `statement_timeout` so it can never hang, and
+ *   1. an exact count, bounded by {@link COUNT_CAP} rows and a `statement_timeout`
+ *      guard so it can never hang, and
  *   2. the planner's instant row estimate.
  *
- * When the exact count returns under the cap in time, it wins ("515 results").
+ * When the exact count returns under the cap in time, it wins ("165 results").
  * Otherwise (capped, or too slow) the rounded estimate is shown ("~34,000
  * results"). Returns `count: null` for empty-query browsing.
  */
@@ -206,17 +210,14 @@ export async function countMatches(filters: SearchFilters): Promise<MatchCount> 
   const q = filters.q ?? ''
   if (q.length === 0) return { count: null, capped: false, estimate: null, ms: 0 }
 
-  const { where, values, bm25Index } = buildFilter(filters)
-  const whereValues = [...values] // WHERE params only, for the EXPLAIN estimate
-  const countValues = [...values]
-  const inner = bm25Index ? `SELECT 1 FROM items ${where} ORDER BY ${bm25Order(q, bm25Index, countValues)} LIMIT ${COUNT_CAP}` : `SELECT 1 FROM items ${where} LIMIT ${COUNT_CAP}`
-  const countText = `SELECT count(*)::int AS n FROM (${inner}) hits`
+  const { where, values } = buildFilter(filters)
+  const countText = `SELECT count(*)::int AS n FROM (SELECT 1 FROM items ${where} LIMIT ${COUNT_CAP}) hits`
 
   const started = performance.now()
   const [estimate, exact] = await Promise.all([
     (async () => {
       try {
-        const rows = (await sql.query(`EXPLAIN (FORMAT JSON) SELECT 1 FROM items ${where}`, whereValues)) as Row[]
+        const rows = (await sql.query(`EXPLAIN (FORMAT JSON) SELECT 1 FROM items ${where}`, values)) as Row[]
         return planEstimate(rows)
       } catch {
         return null
@@ -224,10 +225,7 @@ export async function countMatches(filters: SearchFilters): Promise<MatchCount> 
     })(),
     (async () => {
       try {
-        const stmts = [sql.query(`SET LOCAL statement_timeout = ${COUNT_TIMEOUT_MS | 0}`)]
-        if (bm25Index) stmts.push(sql.query(`SET LOCAL lakebase_bm25.default_limit = ${COUNT_CAP | 0}`))
-        stmts.push(sql.query(countText, countValues))
-        const res = (await sql.transaction(stmts)) as Row[][]
+        const res = (await sql.transaction([sql.query(`SET LOCAL statement_timeout = ${COUNT_TIMEOUT_MS | 0}`), sql.query(countText, values)])) as Row[][]
         return asInt(res[res.length - 1][0]?.n) ?? 0
       } catch {
         return null // statement_timeout (or any error): fall back to the estimate
