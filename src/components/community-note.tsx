@@ -21,6 +21,13 @@ const TWEETS: Tweet[] = [
     url: 'https://x.com/rauchg/status/2099501000520515884',
   },
   {
+    name: 'Nikita | Scaling Postgres',
+    handle: 'nikitabase',
+    avatar: 'https://pbs.twimg.com/profile_images/1585332383502372864/H1HKhMNg_normal.jpg',
+    text: 'Nice example of fast app with @vercel + @neondatabase (including new BM25 full-text search extension lakebase_text)',
+    url: 'https://x.com/nikitabase/status/2099567113874636900',
+  },
+  {
     name: 'Saïd Aitmbarek',
     handle: 'SaidAitmbarek',
     avatar: 'https://pbs.twimg.com/profile_images/1891564978177454080/YzRSDzkw_normal.jpg',
@@ -36,20 +43,11 @@ const TWEETS: Tweet[] = [
   },
 ]
 
-/** Blue verification check. All three accounts are verified. */
+/** Blue verification check. All the accounts are verified. */
 function VerifiedBadge() {
   return (
     <svg viewBox="0 0 24 24" aria-label="Verified account" className="inline-block h-[1em] w-[1em] shrink-0 align-[-0.15em]" fill="#1d9bf0">
       <path d="M22.25 12c0-1.43-.88-2.67-2.19-3.34.46-1.39.2-2.9-.81-3.91s-2.52-1.27-3.91-.81c-.66-1.31-1.91-2.19-3.34-2.19s-2.68.88-3.34 2.19c-1.39-.46-2.9-.2-3.91.81s-1.27 2.52-.81 3.91c-1.31.66-2.19 1.91-2.19 3.34s.88 2.67 2.19 3.34c-.46 1.39-.2 2.9.81 3.91s2.52 1.27 3.91.81c.66 1.31 1.91 2.19 3.34 2.19s2.68-.88 3.34-2.19c1.39.46 2.9.2 3.91-.81s1.27-2.52.81-3.91c1.31-.67 2.19-1.91 2.19-3.34zm-11.71 4.2L6.8 12.46l1.41-1.42 2.26 2.26 4.8-5.23 1.47 1.36-6.2 6.77z" />
-    </svg>
-  )
-}
-
-/** X (Twitter) glyph shown in the corner of each card. */
-function XMark() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden className="h-[0.9em] w-[0.9em] shrink-0 fill-(--hn-gray)">
-      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
     </svg>
   )
 }
@@ -71,7 +69,6 @@ export function CommunityNote() {
                 </span>
                 <span className="truncate">@{t.handle}</span>
               </span>
-              <XMark />
             </div>
             <p className="text-(--hn-ink)">{t.text}</p>
           </a>
