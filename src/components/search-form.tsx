@@ -26,7 +26,7 @@ const SINCE: { id: SearchSince; label: string }[] = [
 ]
 
 /** How long the box waits after a keystroke before it asks the server. */
-const DEBOUNCE_MS = 50
+const DEBOUNCE_MS = 1
 
 function hrefFor(filters: SearchFilters, patch: Partial<SearchFilters>): string {
   const qs = stringifySearchParams({ ...filters, page: undefined, ...patch })
