@@ -20,7 +20,12 @@ export type ItemRecord = {
   parent: number | null
 }
 
-export type SearchHit = ItemRecord & { snippet: string | null }
+/**
+ * `byMarked` is the author with `tin.highlight()`'s markers in it, kept apart
+ * from `by` because `by` is also the `/user/...` link target and has to stay
+ * literal. Null when the query had nothing to highlight.
+ */
+export type SearchHit = ItemRecord & { snippet: string | null; byMarked: string | null }
 export type ThreadItem = ItemRecord & { text: string | null; deleted: boolean; dead: boolean }
 
 export type MatchCount = { count: number | null; ms: number }
@@ -50,6 +55,7 @@ function asHit(row: Row): SearchHit {
     descendants: asInt(row.descendants),
     parent: asInt(row.parent),
     snippet: (row.snippet as string | null) ?? null,
+    byMarked: (row.by_marked as string | null) ?? null,
   }
 }
 
@@ -69,6 +75,7 @@ function asThread(row: Row): ThreadItem {
  */
 const CLEAN_TEXT = `translate(regexp_replace(coalesce(text, ''), '<[^>]+>', ' ', 'g'), chr(1) || chr(2), '')`
 const CLEAN_TITLE = `translate(coalesce(title, ''), chr(1) || chr(2), '')`
+const CLEAN_BY = `translate(coalesce("by", ''), chr(1) || chr(2), '')`
 const MARKS = `chr(1), chr(2)`
 
 /**
@@ -80,11 +87,17 @@ const MARKS = `chr(1), chr(2)`
  *
  * Highlighting returns the whole document and picks no excerpt, so the snippet
  * comes back in full and `excerpt()` trims it around the match at render time.
+ *
+ * The author is highlighted alongside them, and for the same reason: `by` is
+ * part of the indexed text, so a query can match on it and the byline should
+ * say so. It comes back as an extra column rather than in place of `by`, which
+ * the row still needs verbatim for its `/user/...` link.
  */
 function hitColumns(withSnippet: boolean, mark: string | null): string {
   const title = mark ? `tin.highlight(${CLEAN_TITLE}, ${MARKS}, ${mark}) AS title` : 'title'
+  const by = mark ? `tin.highlight(${CLEAN_BY}, ${MARKS}, ${mark}) AS by_marked` : `NULL::text AS by_marked`
   const snippet = !withSnippet ? `NULL::text AS snippet` : mark ? `tin.highlight(${CLEAN_TEXT}, ${MARKS}, ${mark}) AS snippet` : `left(${CLEAN_TEXT}, 240) AS snippet`
-  return `id, type, "by", time, url, score, ${title}, descendants, parent, ${snippet}`
+  return `id, type, "by", ${by}, time, url, score, ${title}, descendants, parent, ${snippet}`
 }
 
 const THREAD_COLUMNS = `id, type, "by", time, url, score, title, text, descendants, parent, deleted, dead`
