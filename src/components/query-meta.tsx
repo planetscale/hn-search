@@ -20,7 +20,7 @@ function Sep() {
 }
 
 /** The gray status line under the search box: match count, query latency, source. */
-export function QueryMeta({ ms, error, countPromise }: { ms: number; error?: string | null; countPromise?: Promise<MatchCount> }) {
+export function QueryMeta({ ms, error, countPromise, fuzzy }: { ms: number; error?: string | null; countPromise?: Promise<MatchCount>; fuzzy?: string[] }) {
   if (error) return <p className="mb-3 text-(length:--text-sm) text-(--hn-gray)">{error}</p>
   return (
     <p className="mb-3 text-(length:--text-sm) text-(--hn-gray)">
@@ -35,6 +35,12 @@ export function QueryMeta({ ms, error, countPromise }: { ms: number; error?: str
         >
           <Count promise={countPromise} />
         </Suspense>
+      ) : null}
+      {fuzzy && fuzzy.length > 0 ? (
+        <>
+          fuzzy: {fuzzy.map((term) => `${term}~2`).join(', ')}
+          <Sep />
+        </>
       ) : null}
       {ms.toFixed(0)} ms
       <Sep />

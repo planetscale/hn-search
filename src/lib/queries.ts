@@ -149,11 +149,17 @@ export type TailMode = 'settled' | 'typing'
  */
 const MIN_WILDCARD_LENGTH = 4
 
-/** Prefix expansion on these roots is very slow; typeahead skips wildcard on them. */
-const TYPEAHEAD_NO_WILDCARD_PREFIXES = ['comput'] as const
+/**
+ * Prefix expansion on these roots is very slow, so a word that is a prefix of
+ * one of them is matched literally instead of being wildcarded: `comp*` unions
+ * every term under `comput...`, which is most of the corpus.
+ */
+const NO_WILDCARD_PREFIXES = ['comput'] as const
 
 export type ToTinQueryOptions = {
   noWildcardPrefixes?: readonly string[]
+  /** Bare-word operands to fuzz with TIN's `~2` instead of matching literally. */
+  fuzzy?: ReadonlySet<string>
 }
 
 function isNoWildcardPrefix(text: string, prefixes?: readonly string[]): boolean {
@@ -237,11 +243,12 @@ export function toTinQuery(
         continue // no positive operand precedes it
       }
       parts.push('AND')
-      parts.push(`NOT ${quoteOperand(operand.text, false)}`)
+      parts.push(`NOT ${quoteOperand(operand.text, 'plain')}`)
       pendingOp = null
       continue
     }
-    const emitted = quoteOperand(operand.text, i === wildcardIndex)
+    const mode = options?.fuzzy?.has(operand.text) ? 'fuzzy' : i === wildcardIndex ? 'wildcard' : 'plain'
+    const emitted = quoteOperand(operand.text, mode)
     if (haveOperand) parts.push(pendingOp === 'OR' ? 'OR' : 'AND')
     parts.push(emitted)
     haveOperand = true
@@ -251,8 +258,37 @@ export function toTinQuery(
   return parts.join(' ')
 }
 
-function quoteOperand(text: string, wildcard: boolean): string {
-  return wildcard ? `${text}*` : `"${text}"`
+type OperandMode = 'plain' | 'wildcard' | 'fuzzy'
+
+function quoteOperand(text: string, mode: OperandMode): string {
+  if (mode === 'fuzzy') return `${text}~2`
+  if (mode === 'wildcard') return `${text}*`
+  return `"${text}"`
+}
+
+/**
+ * A word shorter than this is skipped as a fuzzy candidate: edit distance 2 on
+ * a shorter word matches nearly anything in the dictionary, so fuzzing it
+ * would widen the search rather than rescue it.
+ */
+const MIN_FUZZY_LENGTH = 4
+
+/**
+ * The bare, positive words in the query that are eligible to be fuzzed:
+ * skips `AND`/`OR` operators, negated words, and phrases (fuzzing a phrase or
+ * an exclusion would change what the user asked for, not just widen it).
+ */
+export function fuzzyCandidates(input: string): string[] {
+  const seen = new Set<string>()
+  for (const token of tokenize(input)) {
+    if (token.kind !== 'word') continue
+    if (token.text === 'OR' || token.text === 'AND') continue
+    if (token.text.startsWith('-') && token.text.length > 1) continue
+    const clean = sanitize(token.text)
+    if (!clean || [...clean].length < MIN_FUZZY_LENGTH) continue
+    seen.add(clean)
+  }
+  return [...seen]
 }
 
 type Filter = {
@@ -265,14 +301,21 @@ type Filter = {
   textParam: string | null
 }
 
-function buildFilter(filters: SearchFilters): Filter {
+type BuildFilterOptions = {
+  fuzzy?: ReadonlySet<string>
+  queryOverride?: string
+  tailOverride?: TailMode
+}
+
+function buildFilter(filters: SearchFilters, options?: BuildFilterOptions): Filter {
   const values: unknown[] = []
   const clauses: string[] = []
-  const q = filters.q ?? ''
+  const q = options?.queryOverride ?? filters.q ?? ''
   const type = filters.type
   const scoped = type !== 'all' && (ITEM_TYPES as readonly string[]).includes(type)
 
-  const tinQuery = toTinQuery(q, filters.typing ? 'typing' : 'settled')
+  const tail = options?.tailOverride ?? (filters.typing ? 'typing' : 'settled')
+  const tinQuery = toTinQuery(q, tail, { fuzzy: options?.fuzzy, noWildcardPrefixes: NO_WILDCARD_PREFIXES })
   const hasTextMatch = tinQuery.length > 0
   let textParam: string | null = null
 
@@ -302,7 +345,8 @@ function plainOrder(sort: SearchFilters['sort']): string {
 
 export async function searchItems(filters: SearchFilters, page: number) {
   const offset = (Math.max(1, page) - 1) * PAGE_SIZE
-  const { where, values, q, hasTextMatch, textParam } = buildFilter(filters)
+  const fuzzy = await resolveFuzzy(filters)
+  const { where, values, q, hasTextMatch, textParam } = buildFilter(filters, { fuzzy })
   const cols = hitColumns(filters.type === 'comment' || filters.type === 'pollopt' || (filters.type === 'all' && Boolean(filters.q)), textParam)
   const sort = filters.sort ?? (q ? 'relevance' : 'date')
   const ranked = hasTextMatch && sort === 'relevance'
@@ -324,31 +368,141 @@ export async function searchItems(filters: SearchFilters, page: number) {
       throw err
     }
   })
-  return { rows: rows.map(asHit), ms, page }
+  return { rows: rows.map(asHit), ms, page, fuzzy: [...fuzzy].sort() }
 }
 
 /**
- * Match count for the status line. The filter is exactly a `tin` index's
- * predicate plus its text match, so TIN answers `count(*)` from the index alone
- * — no cap and no planner-estimate fallback. Counting the 29M comments
- * containing "the" touches about a hundred index pages.
+ * The filter is exactly a `tin` index's predicate plus its text match, so TIN
+ * answers `count(*)` from the index alone — no cap and no planner-estimate
+ * fallback. Counting the 29M comments containing "the" touches about a hundred
+ * index pages, which is what makes the fuzzy fallback's repeated counts cheap
+ * enough to run on a keystroke.
  *
  * The aggregate is selected bare. Casting it — even to `int` — costs TIN the
  * custom scan that makes this cheap, and the count falls back to a scan that is
  * seventy times slower. It arrives as a bigint string and is narrowed here
  * instead.
+ */
+async function countFor(filters: SearchFilters, options?: BuildFilterOptions): Promise<number> {
+  const { where, values } = buildFilter(filters, options)
+  const rows = (await sql.query(`SELECT count(*) AS n FROM items ${where}`, values)) as Row[]
+  return asInt(rows[0]?.n) ?? 0
+}
+
+/**
+ * Match count for the status line, counting the same fuzzy-rewritten query the
+ * results came from.
  *
  * Returns `count: null` when there is nothing to count: an empty box, or a box
  * holding only a word too short to search on yet, where the total would be the
  * size of the corpus rather than an answer to anything the user asked.
  */
 export async function countMatches(filters: SearchFilters): Promise<MatchCount> {
-  const { where, values, hasTextMatch } = buildFilter(filters)
+  const { hasTextMatch } = buildFilter(filters)
   if (!hasTextMatch) return { count: null, ms: 0 }
 
   const started = performance.now()
-  const rows = (await sql.query(`SELECT count(*) AS n FROM items ${where}`, values)) as Row[]
-  return { count: asInt(rows[0]?.n) ?? 0, ms: performance.now() - started }
+  const fuzzy = await resolveFuzzy(filters)
+  const count = await countFor(filters, { fuzzy })
+  return { count, ms: performance.now() - started }
+}
+
+/**
+ * A search with fewer matches than this is treated as one worth rescuing, and
+ * fuzzing stops as soon as it clears the bar.
+ */
+const FUZZY_THRESHOLD = 7
+
+/**
+ * Groups cached counts by the non-text filters they were measured under: the
+ * cardinality of a word depends on the type, author and date range it was
+ * counted within, so a count taken under one set of filters says nothing about
+ * the same word under another.
+ */
+function filterKey(filters: SearchFilters): string {
+  return `${filters.type}|${filters.by ?? ''}|${filters.since}`
+}
+
+const termCounts = new Map<string, Map<string, Promise<number>>>()
+
+/** Roughly the number of distinct words a session can type; past it, start over. */
+const TERM_COUNT_LIMIT = 500
+
+/**
+ * How many rows a single word matches on its own, memoized for the life of the
+ * process. This is the only thing worth remembering across keystrokes: a word's
+ * cardinality is a fact about the corpus, not about the query it appeared in, so
+ * it never goes stale while the corpus is being read. Everything downstream of
+ * it — which words are the rare ones, which get fuzzed — is decided fresh every
+ * time, because a single keystroke can reorder it.
+ */
+function termCount(filters: SearchFilters, term: string): Promise<number> {
+  const key = filterKey(filters)
+  let counts = termCounts.get(key)
+  if (!counts) {
+    counts = new Map()
+    termCounts.set(key, counts)
+  }
+  const cached = counts.get(term)
+  if (cached) return cached
+  const pending = countFor(filters, { queryOverride: term, tailOverride: 'settled' })
+  if (counts.size >= TERM_COUNT_LIMIT) counts.clear()
+  counts.set(term, pending)
+  return pending
+}
+
+/**
+ * Decides which of the query's words to fuzz, from scratch, for the query
+ * exactly as it stands.
+ *
+ * The query as typed is counted first — last word wildcarded, by the usual
+ * rules — and a result that already clears `FUZZY_THRESHOLD` is left alone.
+ * Otherwise each candidate word is counted on its own and the rarest goes
+ * first: the word that matches least is the one most likely to be the typo.
+ * Words are fuzzed one at a time until the count clears the threshold or the
+ * candidates run out, which is what rescues two typos in one query.
+ *
+ * Re-deciding on every keystroke is the point. In `planetscale databse`, at
+ * `planetscale d` the correctly spelled `planetscale` is the rarer word and
+ * would be the one fuzzed; by `planetscale databs` the half-typed word has
+ * taken that place, and the earlier answer has to be forgotten for the right
+ * word to win.
+ */
+async function computeFuzzy(filters: SearchFilters): Promise<string[]> {
+  const candidates = fuzzyCandidates(filters.q ?? '')
+  if (candidates.length === 0) return []
+
+  if ((await countFor(filters)) >= FUZZY_THRESHOLD) return []
+
+  const counts = await Promise.all(candidates.map((candidate) => termCount(filters, candidate)))
+  const ordered = candidates.map((candidate, i) => ({ candidate, count: counts[i] })).sort((a, b) => a.count - b.count)
+
+  const fuzzed: string[] = []
+  for (const { candidate } of ordered) {
+    fuzzed.push(candidate)
+    const count = await countFor(filters, { fuzzy: new Set(fuzzed) })
+    if (count >= FUZZY_THRESHOLD) break
+  }
+  return fuzzed
+}
+
+const inFlight = new Map<string, Promise<string[]>>()
+
+/**
+ * The words to fuzz for this query. `searchItems` and `countMatches` both ask,
+ * and both must get the same answer over the same query text, so the in-flight
+ * decision is shared for as long as it takes to resolve and then dropped. It is
+ * a way of asking once per render, not a memo: the next keystroke decides again.
+ */
+export async function resolveFuzzy(filters: SearchFilters): Promise<ReadonlySet<string>> {
+  const key = `${filterKey(filters)}|${filters.typing ? 1 : 0}|${filters.q ?? ''}`
+  const pending = inFlight.get(key) ?? computeFuzzy(filters)
+  inFlight.set(key, pending)
+  try {
+    return new Set(await pending)
+  } finally {
+    inFlight.delete(key)
+  }
 }
 
 /**
@@ -402,9 +556,7 @@ export async function getUserItems(by: string, page: number) {
 
 export async function typeahead(term: string): Promise<SearchHit[]> {
   // Always mid-word: a typeahead is asked for on every keystroke.
-  const tinQuery = toTinQuery(term, 'typing', {
-    noWildcardPrefixes: TYPEAHEAD_NO_WILDCARD_PREFIXES,
-  })
+  const tinQuery = toTinQuery(term, 'typing', { noWildcardPrefixes: NO_WILDCARD_PREFIXES })
   if (!tinQuery) return []
   const rows = (await sql.query(
     `SELECT ${hitColumns(false, null)} FROM items

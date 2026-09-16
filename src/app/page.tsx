@@ -20,11 +20,13 @@ async function Results({ filters, page }: { filters: SearchFilters; page: number
 
   let rows: SearchHit[] = []
   let ms = 0
+  let fuzzy: string[] = []
   let error: string | null = null
   try {
     const result = await searchItems(filters, page)
     rows = result.rows
     ms = result.ms
+    fuzzy = result.fuzzy
   } catch (err) {
     error = err instanceof Error ? err.message : 'Query failed'
   }
@@ -34,7 +36,7 @@ async function Results({ filters, page }: { filters: SearchFilters; page: number
 
   return (
     <div>
-      <QueryMeta ms={ms} error={error} countPromise={countPromise} />
+      <QueryMeta ms={ms} error={error} countPromise={countPromise} fuzzy={fuzzy} />
 
       <ol className="flex flex-col gap-2">
         {rows.map((item, index) => (
