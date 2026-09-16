@@ -2,7 +2,7 @@
 
 import { stringifySearchParams, type SearchFilters, type SearchSince, type SearchSort, type SearchType } from '@/lib/search-params'
 import { useRouter } from 'next/navigation'
-import { useEffect, useRef, useState, useTransition } from 'react'
+import { useEffect, useRef, useTransition } from 'react'
 
 const TYPES: { id: SearchType; label: string }[] = [
   { id: 'story', label: 'Stories' },
@@ -33,25 +33,45 @@ function hrefFor(filters: SearchFilters, patch: Partial<SearchFilters>): string 
   return qs ? `/?${qs}` : '/'
 }
 
+/**
+ * How many recently pushed query strings to remember. Only needs to cover the
+ * navigations that can still be in flight at once, and typing cannot outrun the
+ * network by anything close to this many keystrokes.
+ */
+const PUSHED_HISTORY = 32
+
 export function SearchForm({ filters }: { filters: SearchFilters }) {
   const router = useRouter()
-  const [q, setQ] = useState(filters.q ?? '')
+  // The box is uncontrolled: the browser owns its text and its caret, and React
+  // never rewrites the value while it is being typed in. A controlled value is
+  // what caused Safari to drop keystrokes and jump the caret to the start — a
+  // re-render mid-word rewrites the DOM value and resets the selection with it.
+  const inputRef = useRef<HTMLInputElement>(null)
+  const initialQ = useRef(filters.q ?? '')
   const filtersRef = useRef(filters)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // The last query text we pushed to the URL. Used to tell our own navigations
-  // apart from external ones (back/forward, nav links).
-  const pushedRef = useRef(filters.q ?? '')
+  // Every query text this form has recently put in the URL, not just the last
+  // one. Each keystroke starts its own navigation and their responses can land
+  // out of order, so a URL holding older text is still our own doing and must
+  // not be mistaken for someone pressing Back.
+  const pushedRef = useRef<string[]>([filters.q ?? ''])
   const [, startTransition] = useTransition()
   filtersRef.current = filters
 
-  // Only adopt the URL's query when it changed for a reason other than our own
-  // typing. This never overwrites the box mid-keystroke or moves the cursor.
+  /** The text as it stands in the box, which is the only authority on it. */
+  function currentQ(): string {
+    return inputRef.current?.value ?? initialQ.current
+  }
+
+  // Adopt the URL's query only when it arrived for a reason other than our own
+  // typing: back/forward, or a nav link. Writing to the DOM node directly keeps
+  // this the one place the box is ever overwritten.
   useEffect(() => {
     const urlQ = filters.q ?? ''
-    if (urlQ !== pushedRef.current) {
-      pushedRef.current = urlQ
-      setQ(urlQ)
-    }
+    if (pushedRef.current.includes(urlQ)) return
+    pushedRef.current = [urlQ]
+    const input = inputRef.current
+    if (input && input.value !== urlQ) input.value = urlQ
   }, [filters.q])
 
   function clearTimer() {
@@ -73,12 +93,11 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
   function navigate(nextQ: string, patch: Partial<SearchFilters> = {}, typing = filtersRef.current.typing ?? false) {
     clearTimer()
     const trimmed = nextQ.trim()
-    pushedRef.current = trimmed
+    pushedRef.current = [...pushedRef.current, trimmed].slice(-PUSHED_HISTORY)
     startTransition(() => router.replace(hrefFor({ ...filtersRef.current, q: trimmed || undefined, typing: typing || undefined }, patch)))
   }
 
   function scheduleQuery(next: string) {
-    setQ(next)
     clearTimer()
     timerRef.current = setTimeout(() => navigate(next, {}, true), DEBOUNCE_MS)
   }
@@ -93,7 +112,7 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
       onSubmit={(event) => {
         event.preventDefault()
         // Enter settles the query: the last word stops being a prefix.
-        navigate(q, {}, false)
+        navigate(currentQ(), {}, false)
       }}
     >
       <label className="sr-only" htmlFor="q">
@@ -102,7 +121,8 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
       <input
         id="q"
         name="q"
-        value={q}
+        ref={inputRef}
+        defaultValue={initialQ.current}
         onChange={(event) => scheduleQuery(event.target.value)}
         placeholder="Search stories, comments, jobs…"
         autoComplete="off"
@@ -115,7 +135,7 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
           {TYPES.map((type) => {
             const active = filters.type === type.id
             return (
-              <button key={type.id} type="button" onClick={() => navigate(q, { type: type.id })} className={active ? 'font-bold text-(--hn-orange)' : 'text-(--hn-gray) hover:underline'}>
+              <button key={type.id} type="button" onClick={() => navigate(currentQ(), { type: type.id })} className={active ? 'font-bold text-(--hn-orange)' : 'text-(--hn-gray) hover:underline'}>
                 {type.label}
               </button>
             )
@@ -124,7 +144,7 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
 
         <div className="ml-auto flex items-center gap-x-1 text-(--hn-gray)">
           <span>by</span>
-          <select value={sort} onChange={(event) => navigate(q, { sort: event.target.value as SearchSort })} className="border border-(--hn-gray) bg-white px-1 py-0.5">
+          <select value={sort} onChange={(event) => navigate(currentQ(), { sort: event.target.value as SearchSort })} className="border border-(--hn-gray) bg-white px-1 py-0.5">
             {SORTS.map((option) => (
               <option key={option.id} value={option.id}>
                 {option.label}
@@ -132,7 +152,7 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
             ))}
           </select>
           <span>for</span>
-          <select value={filters.since} onChange={(event) => navigate(q, { since: event.target.value as SearchSince })} className="border border-(--hn-gray) bg-white px-1 py-0.5">
+          <select value={filters.since} onChange={(event) => navigate(currentQ(), { since: event.target.value as SearchSince })} className="border border-(--hn-gray) bg-white px-1 py-0.5">
             {SINCE.map((option) => (
               <option key={option.id} value={option.id}>
                 {option.label}
