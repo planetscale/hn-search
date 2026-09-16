@@ -2,7 +2,7 @@
 export function ResultsLoading({ rows = 8, ranked = true }: { rows?: number; ranked?: boolean }) {
   return (
     <div aria-hidden>
-      <p className="mb-3 text-(length:--text-sm) text-(--hn-gray)">searching Neon…</p>
+      <p className="mb-3 text-(length:--text-sm) text-(--hn-gray)">searching PlanetScale…</p>
       <ol className="flex flex-col gap-2">
         {Array.from({ length: rows }).map((_, i) => (
           <li key={i} className="flex gap-1">

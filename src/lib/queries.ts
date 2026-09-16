@@ -1,21 +1,12 @@
-import { sql, timed } from '@/db'
+import { isTimeout, sql, timed } from '@/db'
 import { ITEM_TYPES, type ItemType } from '@/db/schema'
-import { COUNT_CAP, MAX_CANDIDATES, PAGE_SIZE, sinceCutoff, type SearchFilters } from '@/lib/search-params'
+import { PAGE_SIZE, sinceCutoff, type SearchFilters } from '@/lib/search-params'
 
 /**
- * Each item type has its own partial `lakebase_bm25` index whose predicate
- * matches the `WHERE` below. Ranking and counting therefore happen over the
- * requested type only. The single shared index would rank all five types
- * together and, because it scores just its top `default_limit` candidates,
- * silently drop most stories/jobs before the type filter ran.
+ * The searchable text every `tin` index is built over, repeated verbatim by
+ * every query. Indexing it as an expression keeps the corpus stored once.
  */
-const PARTIAL_BM25: Partial<Record<ItemType, string>> = {
-  story: 'items_story_bm25',
-  comment: 'items_comment_bm25',
-  job: 'items_job_bm25',
-}
-/** Covers `all` and the long-tail types (poll, pollopt) that have no partial index. */
-const FULL_BM25 = 'items_search_bm25'
+const SEARCH_EXPR = `coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')`
 
 export type ItemRecord = {
   id: number
@@ -32,7 +23,7 @@ export type ItemRecord = {
 export type SearchHit = ItemRecord & { snippet: string | null }
 export type ThreadItem = ItemRecord & { text: string | null; deleted: boolean; dead: boolean }
 
-export type MatchCount = { count: number | null; capped: boolean; estimate: number | null; ms: number }
+export type MatchCount = { count: number | null; ms: number }
 
 type Row = Record<string, unknown>
 
@@ -71,55 +62,237 @@ function asThread(row: Row): ThreadItem {
   }
 }
 
-function hitColumns(withSnippet: boolean): string {
-  const snippet = withSnippet ? `left(regexp_replace(coalesce(text, ''), '<[^>]+>', ' ', 'g'), 240) AS snippet` : `NULL::text AS snippet`
-  return `id, type, "by", time, url, score, title, descendants, parent, ${snippet}`
+/**
+ * Comment text with its HTML stripped and the highlight markers removed, so the
+ * only markers in a result are the ones `tin.highlight()` puts there.
+ * `chr(1)`/`chr(2)` are MARK_OPEN and MARK_CLOSE in src/lib/highlight.ts.
+ */
+const CLEAN_TEXT = `translate(regexp_replace(coalesce(text, ''), '<[^>]+>', ' ', 'g'), chr(1) || chr(2), '')`
+const CLEAN_TITLE = `translate(coalesce(title, ''), chr(1) || chr(2), '')`
+const MARKS = `chr(1), chr(2)`
+
+/**
+ * `mark` is the placeholder already holding the TIN query, or null when there is
+ * nothing to highlight. TIN only infers the query for itself when the `==>` is
+ * over the highlighted column; ours matches a concatenation of three, so the
+ * query is passed explicitly. A query it cannot parse returns the text
+ * unchanged, which makes this safe for anything the search box produces.
+ *
+ * Highlighting returns the whole document and picks no excerpt, so the snippet
+ * comes back in full and `excerpt()` trims it around the match at render time.
+ */
+function hitColumns(withSnippet: boolean, mark: string | null): string {
+  const title = mark ? `tin.highlight(${CLEAN_TITLE}, ${MARKS}, ${mark}) AS title` : 'title'
+  const snippet = !withSnippet ? `NULL::text AS snippet` : mark ? `tin.highlight(${CLEAN_TEXT}, ${MARKS}, ${mark}) AS snippet` : `left(${CLEAN_TEXT}, 240) AS snippet`
+  return `id, type, "by", time, url, score, ${title}, descendants, parent, ${snippet}`
 }
 
 const THREAD_COLUMNS = `id, type, "by", time, url, score, title, text, descendants, parent, deleted, dead`
+
+type Token = { kind: 'phrase' | 'word'; text: string; negated: boolean }
+
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = []
+  let i = 0
+  while (i < input.length) {
+    let ch = input[i]
+    if (/\s/.test(ch)) {
+      i++
+      continue
+    }
+    // `-"a phrase"` excludes the phrase, the same way `-word` excludes a word.
+    let negated = false
+    if (ch === '-' && input[i + 1] === '"') {
+      negated = true
+      i++
+      ch = input[i]
+    }
+    if (ch === '"') {
+      const end = input.indexOf('"', i + 1)
+      const inner = end === -1 ? input.slice(i + 1) : input.slice(i + 1, end)
+      tokens.push({ kind: 'phrase', text: inner, negated })
+      i = end === -1 ? input.length : end + 1
+      continue
+    }
+    let j = i
+    while (j < input.length && !/\s/.test(input[j]) && input[j] !== '"') j++
+    tokens.push({ kind: 'word', text: input.slice(i, j), negated: false })
+    i = j
+  }
+  return tokens
+}
+
+/**
+ * Deletes TIN metacharacters (phrases keep their inner spaces) and rejects a
+ * token with nothing left to match on: TIN's tokenizer discards pure
+ * punctuation, which would otherwise leave an empty term in the query.
+ */
+function sanitize(text: string): string {
+  const clean = text.replace(/["()*~^:\\]/g, '')
+  return /[\p{L}\p{N}]/u.test(clean) ? clean : ''
+}
+
+type Operand = { text: string; negated: boolean; wildcardable: boolean }
+type Piece = { kind: 'operand'; operand: Operand } | { kind: 'operator'; op: 'AND' | 'OR' }
+
+/**
+ * How to read the final word in the box: `typing` prefix-matches it, `settled`
+ * matches it literally.
+ */
+export type TailMode = 'settled' | 'typing'
+
+/**
+ * A word shorter than this is matched literally rather than prefix-matched,
+ * even while the box is still being typed in. Expanding a one- to three-letter
+ * prefix unions a large slice of the term dictionary — `th*` matches 20.9M rows
+ * where `"th"` matches 9k — so it costs far more than the narrowing it buys.
+ */
+const MIN_WILDCARD_LENGTH = 4
+
+/** Prefix expansion on these roots is very slow; typeahead skips wildcard on them. */
+const TYPEAHEAD_NO_WILDCARD_PREFIXES = ['comput'] as const
+
+export type ToTinQueryOptions = {
+  noWildcardPrefixes?: readonly string[]
+}
+
+function isNoWildcardPrefix(text: string, prefixes?: readonly string[]): boolean {
+  if (!prefixes?.length) return false
+  const lower = text.toLowerCase()
+  return prefixes.some((prefix) => prefix.startsWith(lower))
+}
+
+/**
+ * Converts search-box text into a safe TIN query string.
+ *
+ * Only the final bare word is treated specially, and only while `tail` is
+ * `typing`: the user may not have finished it, so it is matched as a prefix
+ * (`openbsd chro` becomes `"openbsd" AND chro*`). That holds until they press
+ * Enter, which settles the query and matches the word literally. A word of one
+ * to three characters is matched literally either way. Phrases and negated
+ * terms are never prefix-matched.
+ */
+export function toTinQuery(
+  input: string,
+  tail: TailMode = 'settled',
+  options?: ToTinQueryOptions,
+): string {
+  const tokens = tokenize(input)
+  const pieces: Piece[] = []
+
+  for (const token of tokens) {
+    if (token.kind === 'word' && (token.text === 'OR' || token.text === 'AND')) {
+      pieces.push({ kind: 'operator', op: token.text })
+      continue
+    }
+    if (token.kind === 'word' && token.text.startsWith('-') && token.text.length > 1) {
+      const clean = sanitize(token.text.slice(1))
+      if (!clean) continue
+      pieces.push({ kind: 'operand', operand: { text: clean, negated: true, wildcardable: false } })
+      continue
+    }
+    if (token.kind === 'phrase') {
+      const clean = sanitize(token.text)
+      if (!clean) continue
+      pieces.push({ kind: 'operand', operand: { text: clean, negated: token.negated, wildcardable: false } })
+      continue
+    }
+    const clean = sanitize(token.text)
+    if (!clean) continue
+    pieces.push({ kind: 'operand', operand: { text: clean, negated: false, wildcardable: true } })
+  }
+
+  // Locate the word the user may still be typing and prefix-match it.
+  let wildcardIndex = -1
+  if (tail === 'typing') {
+    for (let i = pieces.length - 1; i >= 0; i--) {
+      const piece = pieces[i]
+      if (piece.kind !== 'operand') continue
+      const text = piece.operand.text
+      if (
+        piece.operand.wildcardable &&
+        [...text].length >= MIN_WILDCARD_LENGTH &&
+        !isNoWildcardPrefix(text, options?.noWildcardPrefixes)
+      ) {
+        wildcardIndex = i
+      }
+      break
+    }
+  }
+
+  const parts: string[] = []
+  let pendingOp: 'AND' | 'OR' | null = null
+  let haveOperand = false
+
+  for (let i = 0; i < pieces.length; i++) {
+    const piece = pieces[i]
+    if (piece.kind === 'operator') {
+      pendingOp = piece.op
+      continue
+    }
+    const { operand } = piece
+    if (operand.negated) {
+      if (!haveOperand) {
+        pendingOp = null
+        continue // no positive operand precedes it
+      }
+      parts.push('AND')
+      parts.push(`NOT ${quoteOperand(operand.text, false)}`)
+      pendingOp = null
+      continue
+    }
+    const emitted = quoteOperand(operand.text, i === wildcardIndex)
+    if (haveOperand) parts.push(pendingOp === 'OR' ? 'OR' : 'AND')
+    parts.push(emitted)
+    haveOperand = true
+    pendingOp = null
+  }
+
+  return parts.join(' ')
+}
+
+function quoteOperand(text: string, wildcard: boolean): string {
+  return wildcard ? `${text}*` : `"${text}"`
+}
 
 type Filter = {
   where: string
   values: unknown[]
   q: string
-  /** Non-null when the query is full-text: the BM25 index that ranks this type. */
-  bm25Index: string | null
-  /** `by`/`since` are not baked into the partial indexes, so they need extra scoring headroom. */
-  hasResidualFilter: boolean
+  /** Whether the query text produced a TIN text-match clause. */
+  hasTextMatch: boolean
+  /** Placeholder holding the TIN query, for `tin.highlight()` to reuse. */
+  textParam: string | null
 }
 
 function buildFilter(filters: SearchFilters): Filter {
   const values: unknown[] = []
-  const clauses = ['NOT deleted', 'NOT dead']
+  const clauses: string[] = []
   const q = filters.q ?? ''
   const type = filters.type
+  const scoped = type !== 'all' && (ITEM_TYPES as readonly string[]).includes(type)
 
-  // A validated literal (never user text) so the planner can match the partial index predicate.
-  if (type !== 'all' && (ITEM_TYPES as readonly string[]).includes(type)) {
-    clauses.push(`type = '${type}'`)
-  }
-  if (filters.by) clauses.push(`"by" = ${push(values, filters.by)}`)
-  const cutoff = sinceCutoff(filters.since)
-  if (cutoff) clauses.push(`time >= ${push(values, cutoff.toISOString())}::timestamptz`)
+  const tinQuery = toTinQuery(q, filters.typing ? 'typing' : 'settled')
+  const hasTextMatch = tinQuery.length > 0
+  let textParam: string | null = null
 
-  let bm25Index: string | null = null
-  if (q.length > 0 && q.length <= 2) {
-    const prefix = `${q}%`
-    clauses.push(`(title ILIKE ${push(values, prefix)} OR "by" ILIKE ${push(values, prefix)})`)
-  } else if (q.length > 2) {
-    // websearch syntax supports "quoted phrases", -negation and OR from the box.
-    clauses.push(`search_tsv @@ websearch_to_tsquery('english', ${push(values, q)})`)
-    bm25Index = (type !== 'all' && PARTIAL_BM25[type as ItemType]) || FULL_BM25
+  clauses.push('NOT deleted', 'NOT dead')
+  // A validated literal, never user text, so the planner can match it against
+  // the per-type index predicate and scope the search to that type alone.
+  if (scoped) clauses.push(`type = '${type}'`)
+
+  if (hasTextMatch) {
+    textParam = push(values, tinQuery)
+    clauses.push(`(${SEARCH_EXPR}) ==> ${textParam}`)
   } else if (type !== 'comment') {
     clauses.push(`title IS NOT NULL AND title <> ''`)
   }
 
-  return { where: `WHERE ${clauses.join(' AND ')}`, values, q, bm25Index, hasResidualFilter: Boolean(filters.by) || Boolean(cutoff) }
-}
+  if (filters.by) clauses.push(`"by" = ${push(values, filters.by)}`)
+  const cutoff = sinceCutoff(filters.since)
+  if (cutoff) clauses.push(`time >= ${push(values, cutoff.toISOString())}::timestamptz`)
 
-/** BM25 relevance ordering; pushes the query text used to build the query vector. */
-function bm25Order(q: string, index: string, values: unknown[]): string {
-  return `search_tsv <@> to_bm25query(to_tsvector('english', ${push(values, q)}), '${index}')`
+  return { where: `WHERE ${clauses.join(' AND ')}`, values, q, hasTextMatch, textParam }
 }
 
 /** Chronological / points ordering, matching the btree index directions (time DESC is NULLS FIRST). */
@@ -127,115 +300,55 @@ function plainOrder(sort: SearchFilters['sort']): string {
   return sort === 'score' ? 'score DESC NULLS LAST, time DESC' : 'time DESC'
 }
 
-/**
- * How many candidates the BM25 index should score. It must cover the page being
- * read (`offset + PAGE_SIZE`); when residual `by`/`since` filters run after the
- * index it is opened to the cap so enough survivors remain.
- */
-function candidateLimit(offset: number, hasResidualFilter: boolean): number {
-  if (hasResidualFilter) return MAX_CANDIDATES
-  return Math.min(MAX_CANDIDATES, offset + PAGE_SIZE + 30)
-}
-
-/**
- * Runs `text`. When a BM25 limit is supplied it wraps the statement in a
- * transaction that first sets `lakebase_bm25.default_limit`. SET cannot be
- * parameterized, so `limit` is interpolated (always a computed integer).
- */
-async function run(limit: number | null, text: string, values: unknown[]): Promise<Row[]> {
-  if (limit == null) return (await sql.query(text, values)) as Row[]
-  const result = (await sql.transaction([sql.query(`SET LOCAL lakebase_bm25.default_limit = ${limit | 0}`), sql.query(text, values)])) as unknown[]
-  return result[1] as Row[]
-}
-
 export async function searchItems(filters: SearchFilters, page: number) {
-  const offset = (page - 1) * PAGE_SIZE
-  const { where, values, q, bm25Index, hasResidualFilter } = buildFilter(filters)
-  const cols = hitColumns(filters.type === 'comment' || filters.type === 'pollopt' || (filters.type === 'all' && Boolean(filters.q)))
+  const offset = (Math.max(1, page) - 1) * PAGE_SIZE
+  const { where, values, q, hasTextMatch, textParam } = buildFilter(filters)
+  const cols = hitColumns(filters.type === 'comment' || filters.type === 'pollopt' || (filters.type === 'all' && Boolean(filters.q)), textParam)
   const sort = filters.sort ?? (q ? 'relevance' : 'date')
+  const ranked = hasTextMatch && sort === 'relevance'
+  const order = ranked ? 'tin.score(ctid) DESC' : plainOrder(sort)
+  const window = `ORDER BY ${order} LIMIT ${push(values, PAGE_SIZE)} OFFSET ${push(values, offset)}`
 
-  let text: string
-  let limit: number | null = null
+  // Highlighting costs per row, and only a ranked scan bounds how many rows get
+  // one: TIN pushes the page into the index as a top-K, so it projects a page's
+  // worth. Ordering by anything else sorts every match, and the highlight would
+  // be computed for all of them — four and a half seconds for a common word — so
+  // there the page is chosen first and only those rows are highlighted.
+  const text = textParam && !ranked ? `SELECT ${cols} FROM items WHERE id IN (SELECT id FROM items ${where} ${window}) ORDER BY ${order}` : `SELECT ${cols} FROM items ${where} ${window}`
 
-  if (bm25Index && sort === 'relevance') {
-    // Page straight off the ranked stream; only score enough to reach this page.
-    const order = bm25Order(q, bm25Index, values)
-    limit = candidateLimit(offset, hasResidualFilter)
-    text = `SELECT ${cols} FROM items ${where} ORDER BY ${order} LIMIT ${push(values, PAGE_SIZE)} OFFSET ${push(values, offset)}`
-  } else if (bm25Index) {
-    // Date/points sort of a text query: an unranked filter is a seq scan, so pull
-    // the BM25 matches (bounded by the cap) and re-sort them. Exact for any query
-    // with at most COUNT_CAP matches, which covers all but the broadest terms.
-    const order = bm25Order(q, bm25Index, values)
-    limit = MAX_CANDIDATES
-    text = `SELECT * FROM (SELECT ${cols} FROM items ${where} ORDER BY ${order} LIMIT ${MAX_CANDIDATES}) hits ORDER BY ${plainOrder(sort)} LIMIT ${push(values, PAGE_SIZE)} OFFSET ${push(values, offset)}`
-  } else {
-    // Browsing or a short prefix: a btree/partial index already provides the order.
-    text = `SELECT ${cols} FROM items ${where} ORDER BY ${plainOrder(sort)} LIMIT ${push(values, PAGE_SIZE)} OFFSET ${push(values, offset)}`
-  }
-
-  const { rows, ms } = await timed(() => run(limit, text, values))
+  const { rows, ms } = await timed(async () => {
+    try {
+      return (await sql.query(text, values)) as Row[]
+    } catch (err) {
+      if (isTimeout(err)) throw new Error('That search took too long. Try narrowing it.')
+      throw err
+    }
+  })
   return { rows: rows.map(asHit), ms, page }
 }
 
-/** Exact counting is abandoned after this long; the estimate takes over. */
-const COUNT_TIMEOUT_MS = 400
-
-/** Reads `Plan Rows` out of an `EXPLAIN (FORMAT JSON)` result row. */
-function planEstimate(rows: Row[]): number | null {
-  const cell = rows[0]?.['QUERY PLAN']
-  const plan = typeof cell === 'string' ? JSON.parse(cell) : cell
-  const rowsEst = plan?.[0]?.Plan?.['Plan Rows']
-  return typeof rowsEst === 'number' ? Math.round(rowsEst) : null
-}
-
 /**
- * Match count for the status line. The `items_search_gin` GIN index serves
- * `search_tsv @@ websearch_to_tsquery(...)` through a bitmap scan, so an exact
- * count is a plain `count(*)` over the filter — no BM25 ordering, no default_limit,
- * and no seq scan. A multi-word query is a tsquery AND: GIN intersects the per-term
- * posting lists, so it is the cheapest case (e.g. "openbsd chrome" ~4ms), not the
- * pathological one it was against the BM25 ranking index. Only very common single
- * terms approach the cap. This still races two things in parallel:
+ * Match count for the status line. The filter is exactly a `tin` index's
+ * predicate plus its text match, so TIN answers `count(*)` from the index alone
+ * — no cap and no planner-estimate fallback. Counting the 29M comments
+ * containing "the" touches about a hundred index pages.
  *
- *   1. an exact count, bounded by {@link COUNT_CAP} rows and a `statement_timeout`
- *      guard so it can never hang, and
- *   2. the planner's instant row estimate.
+ * The aggregate is selected bare. Casting it — even to `int` — costs TIN the
+ * custom scan that makes this cheap, and the count falls back to a scan that is
+ * seventy times slower. It arrives as a bigint string and is narrowed here
+ * instead.
  *
- * When the exact count returns under the cap in time, it wins ("165 results").
- * Otherwise (capped, or too slow) the rounded estimate is shown ("~34,000
- * results"). Returns `count: null` for empty-query browsing.
+ * Returns `count: null` when there is nothing to count: an empty box, or a box
+ * holding only a word too short to search on yet, where the total would be the
+ * size of the corpus rather than an answer to anything the user asked.
  */
 export async function countMatches(filters: SearchFilters): Promise<MatchCount> {
-  const q = filters.q ?? ''
-  if (q.length === 0) return { count: null, capped: false, estimate: null, ms: 0 }
-
-  const { where, values } = buildFilter(filters)
-  const countText = `SELECT count(*)::int AS n FROM (SELECT 1 FROM items ${where} LIMIT ${COUNT_CAP}) hits`
+  const { where, values, hasTextMatch } = buildFilter(filters)
+  if (!hasTextMatch) return { count: null, ms: 0 }
 
   const started = performance.now()
-  const [estimate, exact] = await Promise.all([
-    (async () => {
-      try {
-        const rows = (await sql.query(`EXPLAIN (FORMAT JSON) SELECT 1 FROM items ${where}`, values)) as Row[]
-        return planEstimate(rows)
-      } catch {
-        return null
-      }
-    })(),
-    (async () => {
-      try {
-        const res = (await sql.transaction([sql.query(`SET LOCAL statement_timeout = ${COUNT_TIMEOUT_MS | 0}`), sql.query(countText, values)])) as Row[][]
-        return asInt(res[res.length - 1][0]?.n) ?? 0
-      } catch {
-        return null // statement_timeout (or any error): fall back to the estimate
-      }
-    })(),
-  ])
-  const ms = performance.now() - started
-
-  const exactOk = exact != null && exact < COUNT_CAP
-  return { count: exactOk ? exact : null, capped: !exactOk, estimate: exactOk ? null : estimate, ms }
+  const rows = (await sql.query(`SELECT count(*) AS n FROM items ${where}`, values)) as Row[]
+  return { count: asInt(rows[0]?.n) ?? 0, ms: performance.now() - started }
 }
 
 /**
@@ -278,7 +391,7 @@ export async function getUserItems(by: string, page: number) {
   const { rows, ms } = await timed(
     async () =>
       (await sql.query(
-        `SELECT ${hitColumns(true)} FROM items
+        `SELECT ${hitColumns(true, null)} FROM items
          WHERE "by" = $1 AND NOT deleted AND NOT dead
          ORDER BY time DESC LIMIT $2 OFFSET $3`,
         [by, PAGE_SIZE, offset],
@@ -288,23 +401,17 @@ export async function getUserItems(by: string, page: number) {
 }
 
 export async function typeahead(term: string): Promise<SearchHit[]> {
-  if (!term) return []
-  if (term.length <= 2) {
-    const rows = (await sql.query(
-      `SELECT ${hitColumns(false)} FROM items
-       WHERE (title ILIKE $1 OR "by" ILIKE $1) AND NOT deleted AND NOT dead
-       ORDER BY time DESC LIMIT 8`,
-      [`${term}%`],
-    )) as Row[]
-    return rows.map(asHit)
-  }
-  const rows = await run(
-    200,
-    `SELECT ${hitColumns(false)} FROM items
-     WHERE type = 'story' AND NOT deleted AND NOT dead AND search_tsv @@ plainto_tsquery('english', $1)
-     ORDER BY search_tsv <@> to_bm25query(to_tsvector('english', $1), '${PARTIAL_BM25.story}')
+  // Always mid-word: a typeahead is asked for on every keystroke.
+  const tinQuery = toTinQuery(term, 'typing', {
+    noWildcardPrefixes: TYPEAHEAD_NO_WILDCARD_PREFIXES,
+  })
+  if (!tinQuery) return []
+  const rows = (await sql.query(
+    `SELECT ${hitColumns(false, null)} FROM items
+     WHERE type = 'story' AND NOT deleted AND NOT dead AND (${SEARCH_EXPR}) ==> $1
+     ORDER BY tin.score(ctid) DESC
      LIMIT 8`,
-    [term],
-  )
+    [tinQuery],
+  )) as Row[]
   return rows.map(asHit)
 }

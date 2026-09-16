@@ -1,3 +1,4 @@
+import { syncConfigured } from '@/db'
 import { syncHn, type SyncMode } from '@/lib/hn-sync'
 import { NextRequest } from 'next/server'
 
@@ -25,6 +26,9 @@ function intParam(value: string | null, fallback: number, min: number, max: numb
 
 export async function GET(request: NextRequest) {
   if (!authorized(request)) return new Response('Unauthorized', { status: 401 })
+  // A deployment that only reads has no writable credential, so there is nothing
+  // to sync with. Say so plainly instead of failing once an hour.
+  if (!syncConfigured()) return Response.json({ ok: false, error: 'DATABASE_URL_SYNC is not set; the corpus is read-only here.' }, { status: 501 })
 
   const params = request.nextUrl.searchParams
   const mode: SyncMode = params.get('mode') === 'backfill' ? 'backfill' : 'latest'

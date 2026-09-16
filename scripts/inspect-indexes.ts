@@ -1,10 +1,11 @@
 import '@dotenvx/dotenvx/config'
 import { Client } from 'pg'
+import { pgConnectionConfig } from '../src/lib/pg-url'
 
 async function main() {
   const url = process.env.DATABASE_URL_UNPOOLED
   if (!url) throw new Error('missing DATABASE_URL_UNPOOLED')
-  const c = new Client({ connectionString: url, statement_timeout: 0, query_timeout: 0 })
+  const c = new Client({ ...pgConnectionConfig(url), statement_timeout: 0, query_timeout: 0 })
   await c.connect()
   const indexes = await c.query(`
     SELECT i.relname AS indexname, pg_get_indexdef(i.oid) AS def, am.amname,

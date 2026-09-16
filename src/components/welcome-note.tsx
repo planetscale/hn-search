@@ -1,6 +1,6 @@
 import { CorpusCount } from '@/components/corpus-count'
-import { GithubMark, NeonLogo, VercelMark } from '@/components/logos'
-import { SOURCE_URL } from '@/lib/links'
+import { GithubMark, VercelMark } from '@/components/logos'
+import { PLANETSCALE_URL, SOURCE_URL, TIN_DOCS_URL } from '@/lib/links'
 import { Suspense } from 'react'
 
 /** Intro banner shown above the results status line on the home page. */
@@ -15,11 +15,11 @@ export function WelcomeNote() {
         <CorpusCount />
       </Suspense>
       , synced hourly from HN, live from{' '}
-      <a href="https://neon.com" target="_blank" className="border-b">
-        <NeonLogo className="inline-block h-[1.15em] w-auto align-[-0.2em]" /> Postgres
+      <a href={PLANETSCALE_URL} target="_blank" className="border-b">
+        PlanetScale Postgres
       </a>{' '}
-      <a href="https://neon.com/docs/extensions/lakebase-text" target="_blank" className="border-b">
-        with BM25 ranking
+      <a href={TIN_DOCS_URL} target="_blank" className="border-b">
+        with TIN BM25 ranking
       </a>{' '}
       and deployed on{' '}
       <a href="https://vercel.com" target="_blank" className="border-b">

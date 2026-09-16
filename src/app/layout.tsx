@@ -7,7 +7,7 @@ export const metadata: Metadata = {
     default: 'Hacker News Search',
     template: '%s | Hacker News Search',
   },
-  description: 'Full-text search across the Hacker News corpus, served live from Neon Lakebase Postgres with BM25 ranking.',
+  description: 'Full-text search across the Hacker News corpus, served live from PlanetScale Postgres with TIN BM25 ranking.',
 }
 
 export const dynamic = 'force-dynamic'

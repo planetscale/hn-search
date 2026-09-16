@@ -16,7 +16,7 @@
  * cursor, so the next invocation resumes where this one left off.
  */
 
-import { sql } from '@/db'
+import { writeSql as sql } from '@/db'
 import { ITEM_TYPES, type ItemType } from '@/db/schema'
 import pLimit from 'p-limit'
 
@@ -159,8 +159,9 @@ const UPDATE_SET = COLS.filter((c) => c !== 'id')
   .map((c) => `${c} = EXCLUDED.${c === '"by"' ? '"by"' : c}`)
   .join(', ')
 
-/** Upsert a chunk of rows in a single parameterized statement. `search_tsv` is a
- *  generated column, so it recomputes automatically on both insert and update. */
+/** Upsert a chunk of rows in a single parameterized statement. Searchable text
+ *  is an indexed expression over these columns, so the upsert needs no extra
+ *  work to keep it current. */
 async function upsertChunk(rows: unknown[][]): Promise<number> {
   if (!rows.length) return 0
   const values: unknown[] = []

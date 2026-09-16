@@ -14,38 +14,38 @@ CREATE TABLE IF NOT EXISTS items (
   title text,
   parts bigint[] NOT NULL DEFAULT '{}'::bigint[],
   descendants integer,
-  search_tsv tsvector GENERATED ALWAYS AS (
-    to_tsvector(
-      'english',
-      coalesce(title, '') || ' ' || coalesce("by", '') || ' ' ||
-      coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')
-    )
-  ) STORED,
   CONSTRAINT items_type_check CHECK (type IN ('story', 'comment', 'poll', 'pollopt', 'job'))
 );
-
-DROP TABLE IF EXISTS sync_state;
 
 CREATE INDEX IF NOT EXISTS items_type_time_idx ON items (type, time DESC);
 CREATE INDEX IF NOT EXISTS items_type_score_idx ON items (type, score DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS items_parent_idx ON items (parent);
 CREATE INDEX IF NOT EXISTS items_by_time_idx ON items ("by", time DESC);
-CREATE INDEX IF NOT EXISTS items_title_trgm_idx ON items USING gin (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS items_by_trgm_idx ON items USING gin ("by" gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS items_story_new_idx ON items (time DESC)
   WHERE type = 'story' AND NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
 CREATE INDEX IF NOT EXISTS items_titled_time_idx ON items (time DESC)
   WHERE NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
--- Boolean full-text matching for exact counts: a GIN bitmap scan intersects the
--- per-term posting lists, so multi-word (tsquery AND) counts stay exact and fast.
-CREATE INDEX IF NOT EXISTS items_search_gin ON items USING gin (search_tsv);
-CREATE INDEX IF NOT EXISTS items_search_bm25 ON items USING lakebase_bm25 (search_tsv);
--- Per-type partial BM25 indexes. Their predicates match the app's WHERE clauses
--- so ranking and exact counts run over one type instead of being truncated by
--- the shared index's candidate limit (lakebase_bm25.default_limit).
-CREATE INDEX IF NOT EXISTS items_story_bm25 ON items USING lakebase_bm25 (search_tsv)
+
+-- Searchable text, indexed as an expression so the corpus is stored once. A
+-- `tin` index answers both the match (`==>`) and the BM25 ranking
+-- (`tin.score(ctid)`), and its scan is a true top-K, so no candidate cap needs
+-- tuning. Every query repeats this expression verbatim; see SEARCH_EXPR in
+-- src/lib/queries.ts.
+--
+-- Each index is partial, and its predicate is exactly the WHERE clause the app
+-- writes for that tab. TIN takes a matching predicate as given rather than
+-- re-checking it per row, so matching, ranking and an exact `count(*)` all stay
+-- inside the index. This one covers the `all` tab and the long-tail types
+-- (poll, pollopt).
+CREATE INDEX IF NOT EXISTS items_search_tin ON items
+  USING tin ((coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')))
+  WHERE NOT deleted AND NOT dead;
+CREATE INDEX IF NOT EXISTS items_story_tin ON items
+  USING tin ((coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')))
   WHERE type = 'story' AND NOT deleted AND NOT dead;
-CREATE INDEX IF NOT EXISTS items_comment_bm25 ON items USING lakebase_bm25 (search_tsv)
+CREATE INDEX IF NOT EXISTS items_comment_tin ON items
+  USING tin ((coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')))
   WHERE type = 'comment' AND NOT deleted AND NOT dead;
-CREATE INDEX IF NOT EXISTS items_job_bm25 ON items USING lakebase_bm25 (search_tsv)
+CREATE INDEX IF NOT EXISTS items_job_tin ON items
+  USING tin ((coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')))
   WHERE type = 'job' AND NOT deleted AND NOT dead;

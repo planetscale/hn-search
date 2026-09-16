@@ -1,5 +1,7 @@
+import { Highlight } from '@/components/highlight'
 import { ItemByline } from '@/components/item-byline'
 import { hostFromUrl, itemHeading, stripHtml } from '@/lib/hn'
+import { excerpt } from '@/lib/highlight'
 import type { SearchHit } from '@/lib/queries'
 import Link from 'next/link'
 
@@ -22,14 +24,14 @@ export function ItemRow({ item, index }: { item: SearchHit; index?: number }) {
           <>
             <ItemByline item={item} />
             <Link href={`/item/${item.id}`} className="mt-0.5 block max-w-prose text-(length:--text-sm) whitespace-pre-wrap text-(--hn-ink) hover:underline">
-              {stripHtml(item.snippet)}
+              <Highlight text={excerpt(stripHtml(item.snippet))} />
             </Link>
           </>
         ) : (
           <>
             <span className="leading-snug">
               <Link href={href} {...(external ? { target: '_blank', rel: 'noreferrer' } : {})} className="hover:underline">
-                {itemHeading(item)}
+                <Highlight text={itemHeading(item)} />
               </Link>
               {host ? <span className="ml-1 text-(length:--text-xs) text-(--hn-gray)">({host})</span> : null}
             </span>

@@ -1,4 +1,3 @@
-import { CommunityNote } from '@/components/community-note'
 import { ItemRow } from '@/components/item-row'
 import { ResultsLoading } from '@/components/loading'
 import { QueryMeta } from '@/components/query-meta'
@@ -17,7 +16,7 @@ function hrefWith(filters: SearchFilters, patch: Partial<SearchFilters>): string
 /** Streams in once the query returns; the search box above it stays interactive. */
 async function Results({ filters, page }: { filters: SearchFilters; page: number }) {
   // Start the count alongside the search; it streams into its own inner boundary.
-  const countPromise: Promise<MatchCount> | undefined = filters.q ? countMatches(filters).catch(() => ({ count: null, capped: false, estimate: null, ms: 0 })) : undefined
+  const countPromise: Promise<MatchCount> | undefined = filters.q ? countMatches(filters).catch(() => ({ count: null, ms: 0 })) : undefined
 
   let rows: SearchHit[] = []
   let ms = 0
@@ -58,26 +57,18 @@ async function Results({ filters, page }: { filters: SearchFilters; page: number
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const filters = parseSearchParams(await searchParams)
   const page = pageNumber(filters.page)
-  // A key that changes with the query resets the boundary, so the skeleton
-  // shows on every navigation instead of holding the previous results.
-  const key = `${stringifySearchParams(filters)}#${page}`
 
   return (
     <div>
       <SearchForm filters={filters} />
       <WelcomeNote />
-      <div className="flex flex-col gap-4 sm:flex-row">
-        <div className="min-w-0 flex-1">
-          <Suspense key={key} fallback={<ResultsLoading />}>
-            <Results filters={filters} page={page} />
-          </Suspense>
-        </div>
-        {!filters.q ? (
-          <aside className="sm:w-60 sm:shrink-0">
-            <CommunityNote />
-          </aside>
-        ) : null}
-      </div>
+      {/* No key on the boundary. Each search navigates inside a transition, so
+          React keeps the results that are on screen mounted and swaps in the new
+          ones once they have streamed. The skeleton is only for the first load,
+          when there is nothing to hold. */}
+      <Suspense fallback={<ResultsLoading />}>
+        <Results filters={filters} page={page} />
+      </Suspense>
     </div>
   )
 }

@@ -1,7 +1,7 @@
 /**
  * Fast load of the ClickHouse HN dump:
- * fetch → unzip → parallel COPY (no search_tsv / no indexes) → generated
- * column → btree/trgm indexes. BM25 is opt-in (`--bm25`).
+ * fetch → unzip → parallel COPY into a bare heap → primary key → btree indexes
+ * → `tin` search indexes (skippable with `--skip-tin`).
  *
  *   npm run db:seed
  *   npm run db:seed -- --streams=8 --batch=20000
@@ -18,6 +18,7 @@ import { finished } from 'node:stream/promises'
 import pLimit from 'p-limit'
 import { Client } from 'pg'
 import { from as copyFrom } from 'pg-copy-streams'
+import { pgConnectionConfig } from '../src/lib/pg-url'
 import { describeUrl, unpooledUrl } from './env'
 
 const DATASET_URL = 'https://datasets-documentation.s3.eu-west-3.amazonaws.com/hackernews/hacknernews.csv.gz'
@@ -29,42 +30,34 @@ const CHECKPOINT = path.join(DATA_DIR, 'seed-checkpoint.json')
 const COLUMNS = ['id', 'deleted', 'type', 'by', 'time', 'text', 'dead', 'parent', 'poll', 'kids', 'url', 'score', 'title', 'parts', 'descendants'] as const
 const ALLOWED_TYPES = new Set(['story', 'comment', 'poll', 'pollopt', 'job'])
 
-const SEARCH_TSV_SQL = `to_tsvector(
-  'english',
-  coalesce(title, '') || ' ' || coalesce("by", '') || ' ' ||
-  coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), '')
-)`
+// The searchable text, indexed as an expression so the corpus is stored once.
+// Kept byte-identical to SEARCH_EXPR in src/lib/queries.ts and to drizzle/0001_items.sql.
+const SEARCH_EXPR_SQL = `(coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), ''))`
 
 const INDEX_SQL = `
 CREATE INDEX IF NOT EXISTS items_type_time_idx ON items (type, time DESC);
 CREATE INDEX IF NOT EXISTS items_type_score_idx ON items (type, score DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS items_parent_idx ON items (parent);
 CREATE INDEX IF NOT EXISTS items_by_time_idx ON items ("by", time DESC);
-CREATE INDEX IF NOT EXISTS items_title_trgm_idx ON items USING gin (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS items_by_trgm_idx ON items USING gin ("by" gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS items_story_new_idx ON items (time DESC)
   WHERE type = 'story' AND NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
 CREATE INDEX IF NOT EXISTS items_titled_time_idx ON items (time DESC)
   WHERE NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
 `
 
-// BM25 indexes are opt-in (--bm25): the full corpus index plus per-type partial
-// indexes whose predicates match the app's WHERE clauses.
-const BM25_SQL = `
-CREATE INDEX IF NOT EXISTS items_search_gin ON items USING gin (search_tsv);
-CREATE INDEX IF NOT EXISTS items_search_bm25 ON items USING lakebase_bm25 (search_tsv);
-CREATE INDEX IF NOT EXISTS items_story_bm25 ON items USING lakebase_bm25 (search_tsv)
-  WHERE type = 'story' AND NOT deleted AND NOT dead;
-CREATE INDEX IF NOT EXISTS items_comment_bm25 ON items USING lakebase_bm25 (search_tsv)
-  WHERE type = 'comment' AND NOT deleted AND NOT dead;
-CREATE INDEX IF NOT EXISTS items_job_bm25 ON items USING lakebase_bm25 (search_tsv)
-  WHERE type = 'job' AND NOT deleted AND NOT dead;
-`
+// One `tin` index per tab, each partial on exactly the WHERE clause the app
+// writes for it, so matching, ranking and counting all stay inside the index.
+// On the full dump these are by far the longest step, so each gets its own
+// progress line. The cheap ones run first.
+const TIN_INDEXES: Array<{ name: string; where: string }> = [
+  { name: 'items_job_tin', where: `type = 'job' AND NOT deleted AND NOT dead` },
+  { name: 'items_story_tin', where: `type = 'story' AND NOT deleted AND NOT dead` },
+  { name: 'items_comment_tin', where: `type = 'comment' AND NOT deleted AND NOT dead` },
+  { name: 'items_search_tin', where: `NOT deleted AND NOT dead` },
+]
 
 const CREATE_SQL = `
-CREATE EXTENSION IF NOT EXISTS lakebase_text;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+CREATE EXTENSION IF NOT EXISTS tin;
 DROP TABLE IF EXISTS items CASCADE;
 CREATE TABLE items (
   id bigint NOT NULL,
@@ -86,7 +79,7 @@ CREATE TABLE items (
 `
 
 const args = process.argv.slice(2)
-const withBm25 = args.includes('--bm25')
+const skipTin = args.includes('--skip-tin')
 const forceDownload = args.includes('--force-download')
 const skipDownload = args.includes('--skip-download')
 const skipUnzip = args.includes('--skip-unzip')
@@ -337,7 +330,7 @@ function recordToCsv(record: Record<string, string>): string | null {
 
 function connect(url: string) {
   const client = new Client({
-    connectionString: url,
+    ...pgConnectionConfig(url),
     statement_timeout: 0,
     query_timeout: 0,
     keepAlive: true,
@@ -493,21 +486,24 @@ async function finalize(client: Client) {
   try {
     await client.query(`SET maintenance_work_mem = '2GB'`)
   } catch {
-    // Neon may cap this
+    // The instance may cap this
   }
 
-  console.log('4/5 primary key + generated search_tsv')
+  console.log('4/5 primary key + check constraint')
   await client.query('ALTER TABLE items ADD PRIMARY KEY (id)')
   await client.query(`ALTER TABLE items ADD CONSTRAINT items_type_check CHECK (type IN ('story', 'comment', 'poll', 'pollopt', 'job'))`)
-  await client.query(`ALTER TABLE items ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (${SEARCH_TSV_SQL}) STORED`)
 
-  console.log('5/5 btree / trigram indexes')
+  console.log('5/5 btree indexes')
   await client.query(INDEX_SQL)
-  if (withBm25) {
-    console.log('› BM25 indexes (--bm25): full corpus + per-type partials')
-    await client.query(BM25_SQL)
+  if (!skipTin) {
+    for (const [i, idx] of TIN_INDEXES.entries()) {
+      const started = Date.now()
+      console.log(`› tin index ${i + 1}/${TIN_INDEXES.length}: ${idx.name}`)
+      await client.query(`CREATE INDEX IF NOT EXISTS ${idx.name} ON items USING tin (${SEARCH_EXPR_SQL}) WHERE ${idx.where}`)
+      console.log(`  ✓ ${idx.name} in ${((Date.now() - started) / 60000).toFixed(1)} min`)
+    }
   }
-  // VACUUM (outside a transaction) refreshes the planner and BM25 corpus stats.
+  // VACUUM (outside a transaction) refreshes the planner and corpus statistics.
   await client.query('VACUUM ANALYZE items')
 }
 

@@ -26,6 +26,7 @@
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "sonner": "^2.0.8",
+    "vercel": "^59.16.0",
     "zod": "^4.6.2"
   },
   "devDependencies": {

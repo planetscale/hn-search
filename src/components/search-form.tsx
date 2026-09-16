@@ -25,7 +25,8 @@ const SINCE: { id: SearchSince; label: string }[] = [
   { id: 'year', label: 'past year' },
 ]
 
-const DEBOUNCE_MS = 250
+/** How long the box waits after a keystroke before it asks the server. */
+const DEBOUNCE_MS = 50
 
 function hrefFor(filters: SearchFilters, patch: Partial<SearchFilters>): string {
   const qs = stringifySearchParams({ ...filters, page: undefined, ...patch })
@@ -53,26 +54,33 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
     }
   }, [filters.q])
 
-  useEffect(
-    () => () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    },
-    [],
-  )
-
-  // Navigate using the value the user currently sees, so tab/sort changes keep
-  // whatever is typed even if a debounce has not fired yet.
-  function navigate(nextQ: string, patch: Partial<SearchFilters> = {}) {
+  function clearTimer() {
     if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = null
+  }
+
+  useEffect(() => clearTimer, [])
+
+  /**
+   * Navigate using the value the user currently sees, so tab and sort changes
+   * keep whatever is typed even if the debounce has not fired yet.
+   *
+   * `typing` marks the last word as one the user may still be adding to, which
+   * makes it a prefix match. Typing sets it and Enter clears it; a tab or sort
+   * change passes no opinion and leaves it as it was, so switching tabs never
+   * silently changes what is being searched for.
+   */
+  function navigate(nextQ: string, patch: Partial<SearchFilters> = {}, typing = filtersRef.current.typing ?? false) {
+    clearTimer()
     const trimmed = nextQ.trim()
     pushedRef.current = trimmed
-    startTransition(() => router.replace(hrefFor({ ...filtersRef.current, q: trimmed || undefined }, patch)))
+    startTransition(() => router.replace(hrefFor({ ...filtersRef.current, q: trimmed || undefined, typing: typing || undefined }, patch)))
   }
 
   function scheduleQuery(next: string) {
     setQ(next)
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => navigate(next), DEBOUNCE_MS)
+    clearTimer()
+    timerRef.current = setTimeout(() => navigate(next, {}, true), DEBOUNCE_MS)
   }
 
   const sort = filters.sort ?? (filters.q ? 'relevance' : 'date')
@@ -84,7 +92,8 @@ export function SearchForm({ filters }: { filters: SearchFilters }) {
       className="mb-3"
       onSubmit={(event) => {
         event.preventDefault()
-        navigate(q)
+        // Enter settles the query: the last word stops being a prefix.
+        navigate(q, {}, false)
       }}
     >
       <label className="sr-only" htmlFor="q">

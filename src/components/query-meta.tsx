@@ -5,11 +5,11 @@ import { Suspense } from 'react'
 /** Resolves the streamed count. Rendered inside a Suspense boundary so the
  * result list paints before the (sometimes slower) exact count arrives. */
 async function Count({ promise }: { promise: Promise<MatchCount> }) {
-  const { count, capped, estimate } = await promise
-  if (count == null && !capped) return null // browsing: no total to show
+  const { count } = await promise
+  if (count == null) return null // browsing: no total to show
   return (
     <>
-      {formatMatches(count, capped, estimate)}
+      {formatMatches(count)}
       <Sep />
     </>
   )

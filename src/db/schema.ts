@@ -1,11 +1,11 @@
 import { sql } from 'drizzle-orm'
-import { bigint, boolean, customType, index, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core'
+import { bigint, boolean, index, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core'
 
-const tsvector = customType<{ data: string }>({
-  dataType() {
-    return 'tsvector'
-  },
-})
+/**
+ * Searchable text, indexed as an expression so the corpus is stored once. Every
+ * query repeats it verbatim; see SEARCH_EXPR in src/lib/queries.ts.
+ */
+const searchText = sql`(coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), ''))`
 
 export const ITEM_TYPES = ['story', 'comment', 'poll', 'pollopt', 'job'] as const
 export type ItemType = (typeof ITEM_TYPES)[number]
@@ -34,38 +34,36 @@ export const items = pgTable(
       .notNull()
       .default(sql`'{}'::bigint[]`),
     descendants: integer('descendants'),
-    searchTsv: tsvector('search_tsv').generatedAlwaysAs(sql`to_tsvector('english', coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), ''))`),
   },
   (table) => [
     index('items_type_time_idx').on(table.type, table.time),
     index('items_type_score_idx').on(table.type, table.score),
     index('items_parent_idx').on(table.parent),
     index('items_by_time_idx').on(table.by, table.time),
-    index('items_title_trgm_idx').using('gin', sql`${table.title} gin_trgm_ops`),
-    index('items_by_trgm_idx').using('gin', sql`${table.by} gin_trgm_ops`),
     index('items_story_new_idx')
       .on(table.time)
       .where(sql`${table.type} = 'story' AND NOT ${table.deleted} AND NOT ${table.dead} AND ${table.title} IS NOT NULL AND ${table.title} <> ''`),
     index('items_titled_time_idx')
       .on(table.time)
       .where(sql`NOT ${table.deleted} AND NOT ${table.dead} AND ${table.title} IS NOT NULL AND ${table.title} <> ''`),
-    // Boolean full-text matching for exact match counts: a GIN bitmap scan of
-    // search_tsv intersects per-term posting lists, so multi-word (tsquery AND)
-    // counts stay exact and fast. Ranking still uses the lakebase_bm25 indexes below.
-    index('items_search_gin').using('gin', table.searchTsv),
-    // Full corpus, used by the "all" tab and long-tail types (poll, pollopt).
-    index('items_search_bm25').using('lakebase_bm25', table.searchTsv),
-    // Per-type partial indexes: the query filters by type, so ranking and exact
-    // counts happen over the requested type alone instead of being truncated by
-    // the shared index's top-N candidate limit.
-    index('items_story_bm25')
-      .using('lakebase_bm25', table.searchTsv)
+    // One `tin` index per tab, each answering both the match (`==>`) and the
+    // BM25 ranking (`tin.score(ctid)`). Its scan is a true top-K, so there is no
+    // candidate cap to tune. Each predicate is exactly the WHERE clause the app
+    // writes for that tab: TIN takes a matching predicate as given rather than
+    // re-checking it per row, so matching, ranking and an exact `count(*)` all
+    // stay inside the index. This one covers the `all` tab and the long-tail
+    // types (poll, pollopt).
+    index('items_search_tin')
+      .using('tin', searchText)
+      .where(sql`NOT ${table.deleted} AND NOT ${table.dead}`),
+    index('items_story_tin')
+      .using('tin', searchText)
       .where(sql`${table.type} = 'story' AND NOT ${table.deleted} AND NOT ${table.dead}`),
-    index('items_comment_bm25')
-      .using('lakebase_bm25', table.searchTsv)
+    index('items_comment_tin')
+      .using('tin', searchText)
       .where(sql`${table.type} = 'comment' AND NOT ${table.deleted} AND NOT ${table.dead}`),
-    index('items_job_bm25')
-      .using('lakebase_bm25', table.searchTsv)
+    index('items_job_tin')
+      .using('tin', searchText)
       .where(sql`${table.type} = 'job' AND NOT ${table.deleted} AND NOT ${table.dead}`),
   ],
 )

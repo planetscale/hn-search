@@ -15,8 +15,8 @@
  *      the live cron already inserted) can never duplicate a row. They differ
  *      only in what indexes exist during the load:
  *        --mode=online  (default) leaves every index live, so search keeps
- *          working, but each row pays BM25 + GIN index maintenance.
- *        --mode=rebuild drops all 12 secondary indexes first (keeping only the
+ *          working, but each row pays `tin` index maintenance.
+ *        --mode=rebuild drops all 10 secondary indexes first (keeping only the
  *          primary key) and recreates them once at the end. Far faster for a
  *          large one-shot load, but search is degraded until the rebuild
  *          finishes, so run it in a maintenance window.
@@ -30,9 +30,8 @@
  *   npm run db:backfill -- --phase=all                    # fetch then online load
  *   npm run db:backfill -- --phase=fetch --from=28738665 --to=30000000
  *
- * Ideal setup: run it on a small box in the DB's region (us-east-2) and raise the
- * Neon compute's autoscaling ceiling for the duration, since load throughput is
- * CPU-bound on the database, not on this machine.
+ * Ideal setup: run it on a small box in the database's region, since load
+ * throughput is CPU-bound on the database, not on this machine.
  */
 
 import { createReadStream, createWriteStream } from 'node:fs'
@@ -43,6 +42,7 @@ import { createGunzip, createGzip } from 'node:zlib'
 import pLimit from 'p-limit'
 import { Client } from 'pg'
 import { from as copyFrom } from 'pg-copy-streams'
+import { pgConnectionConfig } from '../src/lib/pg-url'
 import { describeUrl, unpooledUrl } from './env'
 
 const HN_API = 'https://hacker-news.firebaseio.com/v0'
@@ -63,34 +63,33 @@ const SECONDARY_INDEXES = [
   'items_type_score_idx',
   'items_parent_idx',
   'items_by_time_idx',
-  'items_title_trgm_idx',
-  'items_by_trgm_idx',
   'items_story_new_idx',
   'items_titled_time_idx',
-  'items_search_gin',
-  'items_search_bm25',
-  'items_story_bm25',
-  'items_comment_bm25',
-  'items_job_bm25',
+  'items_search_tin',
+  'items_story_tin',
+  'items_comment_tin',
+  'items_job_tin',
 ]
+
+// The searchable text. Byte-identical to SEARCH_EXPR in src/lib/queries.ts.
+const SEARCH_EXPR_SQL = `(coalesce(title, '') || ' ' || coalesce("by", '') || ' ' || coalesce(regexp_replace(text, '<[^>]+>', ' ', 'g'), ''))`
+
 const RECREATE_SQL = `
 CREATE INDEX IF NOT EXISTS items_type_time_idx ON items (type, time DESC);
 CREATE INDEX IF NOT EXISTS items_type_score_idx ON items (type, score DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS items_parent_idx ON items (parent);
 CREATE INDEX IF NOT EXISTS items_by_time_idx ON items ("by", time DESC);
-CREATE INDEX IF NOT EXISTS items_title_trgm_idx ON items USING gin (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS items_by_trgm_idx ON items USING gin ("by" gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS items_story_new_idx ON items (time DESC)
   WHERE type = 'story' AND NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
 CREATE INDEX IF NOT EXISTS items_titled_time_idx ON items (time DESC)
   WHERE NOT deleted AND NOT dead AND title IS NOT NULL AND title <> '';
-CREATE INDEX IF NOT EXISTS items_search_gin ON items USING gin (search_tsv);
-CREATE INDEX IF NOT EXISTS items_search_bm25 ON items USING lakebase_bm25 (search_tsv);
-CREATE INDEX IF NOT EXISTS items_story_bm25 ON items USING lakebase_bm25 (search_tsv)
+CREATE INDEX IF NOT EXISTS items_search_tin ON items USING tin (${SEARCH_EXPR_SQL})
+  WHERE NOT deleted AND NOT dead;
+CREATE INDEX IF NOT EXISTS items_story_tin ON items USING tin (${SEARCH_EXPR_SQL})
   WHERE type = 'story' AND NOT deleted AND NOT dead;
-CREATE INDEX IF NOT EXISTS items_comment_bm25 ON items USING lakebase_bm25 (search_tsv)
+CREATE INDEX IF NOT EXISTS items_comment_tin ON items USING tin (${SEARCH_EXPR_SQL})
   WHERE type = 'comment' AND NOT deleted AND NOT dead;
-CREATE INDEX IF NOT EXISTS items_job_bm25 ON items USING lakebase_bm25 (search_tsv)
+CREATE INDEX IF NOT EXISTS items_job_tin ON items USING tin (${SEARCH_EXPR_SQL})
   WHERE type = 'job' AND NOT deleted AND NOT dead;
 `
 
@@ -179,7 +178,7 @@ function toLine(raw: HnItem | null): string | null {
 }
 
 function connect(url: string) {
-  const client = new Client({ connectionString: url, statement_timeout: 0, query_timeout: 0, keepAlive: true })
+  const client = new Client({ ...pgConnectionConfig(url), statement_timeout: 0, query_timeout: 0, keepAlive: true })
   client.setMaxListeners(50)
   return client
 }
@@ -356,14 +355,18 @@ async function runLoad(url: string) {
         try {
           await post.query(stmt)
         } catch {
-          // Neon may cap or reject; the build still runs, just slower.
+          // The instance may cap or reject; the build still runs, just slower.
         }
       }
-      console.log('› recreating 12 secondary indexes (the slow part; BM25 + GIN dominate)')
+      console.log(`› recreating ${SECONDARY_INDEXES.length} secondary indexes (the slow part; the tin indexes dominate)`)
       await post.query(RECREATE_SQL)
     }
-    console.log('› ANALYZE items')
-    await post.query('ANALYZE items')
+    // VACUUM, not just ANALYZE: a freshly loaded heap has no visibility map, and
+    // without one every `count(*)` has to visit the heap to check each match.
+    // That is the difference between a common word counting in 100 index pages
+    // and in several gigabytes of heap reads.
+    console.log('› VACUUM ANALYZE items')
+    await post.query('VACUUM ANALYZE items')
   } finally {
     await post.end()
   }
